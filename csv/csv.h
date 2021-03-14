@@ -21,6 +21,7 @@ private:
     QString m_string;
     int m_pos;
 
-    static QTextCodec const* const m_codec;
+    static void initCodec();
+    static QTextCodec const* m_codec;
     static const QRegExp m_rx, m_rx2;
 };
