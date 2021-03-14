@@ -19,9 +19,22 @@
 #include <utility>
 #include <algorithm>
 
-const QTextCodec* const CSV::m_codec = QTextCodec::codecForName("System");
 const QRegExp CSV::m_rx = QRegExp(QString("((?:(?:[^;\\n]*;?)|(?:\"[^\"]*\";?))*)?\\n?"));
 const QRegExp CSV::m_rx2 = QRegExp(QString("(?:\"([^\"]*)\";?)|(?:([^;]*);?)?"));
+
+QTextCodec& CSV::getCodec()
+{
+    auto* codec = QTextCodec::codecForName("System");
+    if (codec)
+        return *codec;
+    codec = QTextCodec::codecForLocale();
+    if (codec)
+        return *codec;
+    codec = QTextCodec::codecForName("UTF-8");
+    if (codec)
+        return *codec;
+    throw std::runtime_error("Cannot find QTextCodec");
+}
 
 CSV::CSV(QIODevice* device) :
     m_device(device),
@@ -29,7 +42,8 @@ CSV::CSV(QIODevice* device) :
 {
     if (m_device && m_device->isReadable())
     {
-        QTextDecoder dec(m_codec);
+        static const QTextCodec& codec = getCodec();
+        QTextDecoder dec(&codec);
         m_string = dec.toUnicode(m_device->readAll());
     }
 }

@@ -16,11 +16,12 @@ public:
     static bool getGameData(int gameID, unsigned char* table, QString& gamename);
 private:
     CSV(QIODevice* device);
+    static QTextCodec& getCodec();
 
     QIODevice* m_device;
     QString m_string;
     int m_pos;
 
-    static QTextCodec const* const m_codec;
+    static void initCodec();
     static const QRegExp m_rx, m_rx2;
 };
