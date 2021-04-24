@@ -24,18 +24,67 @@
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>Offset Forward</source>
+        <source>Camera Configuration</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>Offset Up</source>
+        <source>Head Center Offset</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> mm</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Use only yaw and pitch while calibrating.
+Don&apos;t roll or change position.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Start calibration</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Right</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Forward</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Up</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Show Network Input</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
-    <name>neuralnet_dialog</name>
+    <name>neuralnet_tracker_ns::neuralnet_dialog</name>
     <message>
         <source>Default</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 yaw samples. Yaw more to %2 samples for stable calibration.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 pitch samples. Pitch more to %2 samples for stable calibration.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 samples. Over %2, good!</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stop calibration</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Start calibration</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

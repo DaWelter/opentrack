@@ -9,9 +9,10 @@
 #include "compat/sleep.hpp"
 #include "compat/math-imports.hpp"
 #include "cv/init.hpp"
-#include <eigen3/Eigen/src/Geometry/Quaternion.h>
 #include <opencv2/core.hpp>
+#include <opencv2/core/hal/interface.h>
 #include <opencv2/core/types.hpp>
+#include <opencv2/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include "compat/timer.hpp"
 #include <omp.h>
@@ -24,40 +25,24 @@
 #include <QDebug>
 #include <QFile>
 
-#include <vector>
-#include <tuple>
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
-#include <iterator>
-#include <iostream>
+#include <chrono>
+
+// Some demo code for onnx
+// https://github.com/microsoft/onnxruntime/blob/master/csharp/test/Microsoft.ML.OnnxRuntime.EndToEndTests.Capi/C_Api_Sample.cpp
+// https://github.com/leimao/ONNX-Runtime-Inference/blob/main/src/inference.cpp
 
 namespace
 {
 
-int enum_to_fps(int value)
-{
-    int fps;
+using numeric_types::vec3;
+using numeric_types::vec2;
+using numeric_types::mat33;
 
-    switch (value)
-    {
-    default: eval_once(qDebug() << "aruco: invalid fps enum value");
-    [[fallthrough]];
-    case fps_default:   fps = 0; break;
-    case fps_30:        fps = 30; break;
-    case fps_60:        fps = 60; break;
-    case fps_75:        fps = 75; break;
-    case fps_125:       fps = 125; break;
-    case fps_200:       fps = 200; break;
-    case fps_50:        fps = 50; break;
-    case fps_100:       fps = 100; break;
-    case fps_120:       fps = 120; break;
-    case fps_300:       fps = 300; break;
-    case fps_250:       fps = 250; break;
-    }
-
-    return fps;
-}
+// Minimal difference if at all going from 1 to 2 threads.
+static constexpr int num_threads = 1;
 
 
 #if _MSC_VER
@@ -116,16 +101,53 @@ cv::Point2f normalize(const cv::Point2f &p, int h, int w)
     };
 }
 
+
+mat33 rotation_from_two_vectors(const vec3 &a, const vec3 &b)
+{
+    vec3 axis = a.cross(b);
+    const float len_a = cv::norm(a);
+    const float len_b = cv::norm(b);
+    const float len_axis = cv::norm(axis);
+    const float sin_angle = std::clamp(len_axis / (len_a * len_b), -1.f, 1.f);
+    const float angle = std::asin(sin_angle);
+    axis *= angle/(1.e-12 + len_axis);
+    mat33 out;
+    cv::Rodrigues(axis, out);
+    return out;
+}
+
+
 /* Computes correction due to head being off screen center.
     x, y: In screen space, i.e. in [-1,1]
     focal_length_x: In screen space
 */
-Eigen::Quaternionf compute_rotation_correction(const cv::Point2f &p, float focal_length_x)
+mat33 compute_rotation_correction(const cv::Point2f &p, float focal_length_x)
 {
-    return Eigen::Quaternionf::FromTwoVectors(
-        Eigen::Vector3f::UnitX(),
-        Eigen::Vector3f{focal_length_x, p.y, p.x});
+    return rotation_from_two_vectors(
+        {1.f,0.f,0.f}, 
+        {focal_length_x, p.y, p.x});
 }
+
+
+mat33 quaternion_to_mat33(const std::array<float,4> quat)
+{
+    mat33 m;
+    const float w = quat[0];
+    const float i = quat[1];
+    const float j = quat[2];
+    const float k = quat[3];
+    m(0,0) = 1.f - 2.f*(j*j + k*k);
+    m(1,0) =       2.f*(i*j + k*w);
+    m(2,0) =       2.f*(i*k - j*w);
+    m(0,1) =       2.f*(i*j - k*w);
+    m(1,1) = 1.f - 2.f*(i*i + k*k);
+    m(2,1) =       2.f*(j*k + i*w);
+    m(0,2) =       2.f*(i*k + j*w);
+    m(1,2) =       2.f*(j*k - i*w);
+    m(2,2) = 1.f - 2.f*(i*i + j*j);
+    return m;
+}
+
 
 template<class T>
 T iou(const cv::Rect_<T> &a, const cv::Rect_<T> &b)
@@ -138,7 +160,23 @@ T iou(const cv::Rect_<T> &a, const cv::Rect_<T> &b)
 } // namespace
 
 
-neuralnet_tracker::Localizer::Localizer(Ort::MemoryInfo &allocator_info, Ort::Session &&session) :
+namespace neuralnet_tracker_ns
+{
+
+
+int enum_to_fps(int value)
+{
+    switch (value)
+    {
+        case fps_30:        return 30;
+        case fps_60:        return 60;
+        default: [[fallthrough]];
+        case fps_default:   return 0;
+    }
+}
+
+
+Localizer::Localizer(Ort::MemoryInfo &allocator_info, Ort::Session &&session) :
     session{std::move(session)},
     scaled_frame(input_img_height, input_img_width, CV_8U),
     input_mat(input_img_height, input_img_width, CV_32F)
@@ -154,7 +192,7 @@ neuralnet_tracker::Localizer::Localizer(Ort::MemoryInfo &allocator_info, Ort::Se
 }
 
 
-std::pair<float, cv::Rect2f> neuralnet_tracker::Localizer::run(
+std::pair<float, cv::Rect2f> Localizer::run(
     const cv::Mat &frame)
 {
     auto p = input_mat.ptr(0);
@@ -169,31 +207,31 @@ std::pair<float, cv::Rect2f> neuralnet_tracker::Localizer::run(
     const char* input_names[] = {"x"};
     const char* output_names[] = {"logit_box"};
 
-    Timer t_; t_.start();
+    //Timer t_; t_.start();
 
     const auto nt = omp_get_num_threads();
-    omp_set_num_threads(1);
+    omp_set_num_threads(num_threads);
     session.Run(Ort::RunOptions{nullptr}, input_names, &input_val, 1, output_names, &output_val, 1);
     omp_set_num_threads(nt);
 
-    std::cout << "localizer: " << t_.elapsed_ms() << " ms\n";
+    //qDebug() << "localizer: " << t_.elapsed_ms() << " ms\n";
 
-    return {
-        sigmoid(results[0]),
-        {
-            results[1],
-            results[2],
-            results[3]-results[1], // Width
-            results[4]-results[2] // Height
-        }};
+    const cv::Rect2f roi = unnormalize(cv::Rect2f{
+        results[1],
+        results[2],
+        results[3]-results[1], // Width
+        results[4]-results[2] // Height
+    }, frame.rows, frame.cols);
+    const float score = sigmoid(results[0]);
+
+    return { score, roi };
 }
 
 
-neuralnet_tracker::PoseEstimator::PoseEstimator(Ort::MemoryInfo &allocator_info, Ort::Session &&session) :
+PoseEstimator::PoseEstimator(Ort::MemoryInfo &allocator_info, Ort::Session &&session) :
     session{std::move(session)},
     scaled_frame(input_img_height, input_img_width, CV_8U),
     input_mat(input_img_height, input_img_width, CV_32F)
-    //output_keypoints(keypoint_dim, num_keypoints)
 {
     {
         const std::int64_t input_shape[4] = { 1, 1, input_img_height, input_img_width };
@@ -212,12 +250,6 @@ neuralnet_tracker::PoseEstimator::PoseEstimator(Ort::MemoryInfo &allocator_info,
             allocator_info, &output_quat[0], output_quat.rows, output_shape, 2);
     }
 
-    // {
-    //     const std::int64_t output_shape[3] = { 1, keypoint_dim, num_keypoints };
-    //     output_val_keypoints = Ort::Value::CreateTensor<float>(
-    //         allocator_info, output_keypoints.ptr<float>(), output_keypoints.total(), output_shape, 3);
-    // }
-
     {
         const std::int64_t output_shape[2] = { 1, 4 };
         output_val[2] = Ort::Value::CreateTensor<float>(
@@ -226,7 +258,31 @@ neuralnet_tracker::PoseEstimator::PoseEstimator(Ort::MemoryInfo &allocator_info,
 }
 
 
-std::optional<neuralnet_tracker::PoseEstimator::Face> neuralnet_tracker::PoseEstimator::run(
+int PoseEstimator::find_input_intensity_90_pct_quantile() const
+{
+    const int channels[] = { 0 };
+    const int hist_size[] = { 255 };
+    float range[] = { 0, 256 };
+    const float* ranges[] = { range };
+    cv::Mat hist; // TODO: Preallocate, but whatever I tried, I ran into asserts in opencv ...
+    cv::calcHist(&scaled_frame, 1,  channels, cv::Mat(), hist, 1, hist_size, ranges, true, false);
+    int gray_level = 0;
+    const int num_pixels_quantile = scaled_frame.total()*0.9f;
+    int num_pixels_accum = 0;
+    for (int i=0; i<hist_size[0]; ++i)
+    {
+        num_pixels_accum += hist.at<float>(i);
+        if (num_pixels_accum > num_pixels_quantile)
+        {
+            gray_level = i;
+            break;
+        }
+    }
+    return gray_level;
+}
+
+
+std::optional<PoseEstimator::Face> PoseEstimator::run(
     const cv::Mat &frame, const cv::Rect &box)
 {
     cv::Mat cropped;
@@ -238,14 +294,21 @@ std::optional<neuralnet_tracker::PoseEstimator::Face> neuralnet_tracker::PoseEst
     };
     cv::getRectSubPix(frame, {patch_size, patch_size}, patch_center, cropped);
 
+    // Will get failure if patch_center is outside image boundaries.
+    // Have to catch this case.
     if (cropped.rows != patch_size || cropped.cols != patch_size)
         return {};
     
     auto p = input_mat.ptr(0);
 
     cv::resize(cropped, scaled_frame, { input_img_width, input_img_height }, 0, 0, cv::INTER_AREA);
-    //cv::imwrite("/tmp/pose_estimator_input.png", scaled_frame);
-    scaled_frame.convertTo(input_mat, CV_32F, 1./255., -0.5);
+
+    // Automatic brightness amplification.
+    const int brightness = find_input_intensity_90_pct_quantile();
+    const double alpha = brightness<127 ? 0.5/std::max(5,brightness) : 1./255;
+    const double beta = -0.5;
+
+    scaled_frame.convertTo(input_mat, CV_32F, alpha, beta);
 
     assert (input_mat.ptr(0) == p);
     assert (!input_mat.empty() && input_mat.isContinuous());
@@ -254,14 +317,19 @@ std::optional<neuralnet_tracker::PoseEstimator::Face> neuralnet_tracker::PoseEst
     const char* input_names[] = {"x"};
     const char* output_names[] = {"pos_size", "quat", "box"};
 
-    Timer t_; t_.start();
+    //Timer t_; t_.start();
 
     const auto nt = omp_get_num_threads();
-    omp_set_num_threads(1);
+    omp_set_num_threads(num_threads);
     session.Run(Ort::RunOptions{nullptr}, input_names, &input_val, 1, output_names, output_val, 3);
     omp_set_num_threads(nt);
 
-    std::cout << "pose net: " << t_.elapsed_ms() << " ms\n";
+    // FIXME: Execution time fluctuates wildly. 19 to 26 ms. Why???
+    //        The instructions are always the same. Maybe a memory allocation
+    //        issue. The ONNX api suggests that tensor are allocated in an
+    //        arena. Does that matter? Maybe the issue is something else?
+
+    //qDebug() << "pose net: " << t_.elapsed_ms() << " ms\n";
 
     // Perform coordinate transformation.
     // From patch-local normalized in [-1,1] to
@@ -272,8 +340,8 @@ std::optional<neuralnet_tracker::PoseEstimator::Face> neuralnet_tracker::PoseEst
 
     const float size = patch_size*0.5f*output_coord[2];
 
-    // Eigen takes quat components in the order w, x, y, z.
-    const Eigen::Quaternionf rotation = { 
+    // Following Eigen which uses quat components in the order w, x, y, z.
+    const std::array<float,4> rotation = { 
         output_quat[3], 
         output_quat[0], 
         output_quat[1], 
@@ -287,8 +355,20 @@ std::optional<neuralnet_tracker::PoseEstimator::Face> neuralnet_tracker::PoseEst
     };
 
     return std::optional<Face>({
-        rotation, cv::Mat_<float>{}, outbox, center, size
+        rotation, outbox, center, size
     });
+}
+
+
+cv::Mat PoseEstimator::last_network_input() const
+{
+    cv::Mat ret;
+    if (!input_mat.empty())
+    {
+        input_mat.convertTo(ret, CV_8U, 255., 127.);
+        cv::cvtColor(ret, ret, cv::COLOR_GRAY2RGB);
+    }
+    return ret;
 }
 
 
@@ -299,13 +379,10 @@ bool neuralnet_tracker::detect()
         iou(*last_localizer_roi,*last_roi)<0.25)
     {
         auto [p, rect] = localizer->run(grayscale);
-
-        const cv::Rect2f pix_rect = unnormalize(rect, frame.rows, frame.cols);
-
         if (p > 0.5)
         {
-            last_localizer_roi = pix_rect;
-            last_roi = pix_rect;
+            last_localizer_roi = rect;
+            last_roi = rect;
         }
     }
 
@@ -319,11 +396,65 @@ bool neuralnet_tracker::detect()
         last_roi.reset();
         return false;
     }
-    else
+
+    last_roi = face->box;
+
+    Affine pose = compute_pose(*face);
+
+    draw_gizmos(frame, *face, pose);
+
     {
-        last_roi = face->box;
+        QMutexLocker lck(&mtx);
+        this->pose_ = pose;
     }
-    
+
+    return true;
+}
+
+
+Affine neuralnet_tracker::compute_pose(const PoseEstimator::Face &face) const
+{
+    const mat33 rot_correction = compute_rotation_correction(
+        normalize(face.center, frame.rows, frame.cols),
+        intrinsics.focal_length_w);
+
+    const mat33 m = rot_correction * quaternion_to_mat33(face.rotation);
+
+    /*
+         
+       hhhhhh  <- head size (meters)
+      \      | -----------------------
+       \     |                         \
+        \    |                          |
+         \   |                          |- tz (meters)
+          ____ <- face.size / width     |
+           \ |  |                       |
+            \|  |- focal length        /
+               ------------------------
+    */
+
+    // Compute the location the network outputs in 3d space.
+    const vec3 face_world_pos = image_to_world(face.center.x, face.center.y, face.size, head_size_mm);
+
+    // But this is in general not the location of the rotation joint in the neck.
+    // So we need an extra offset. Which we determine by solving
+    // z,y,z-pos = head_joint_loc + R_face * offset
+
+    const vec3 pos = face_world_pos
+        + m * vec3{
+            static_cast<float>(s.offset_fwd), 
+            static_cast<float>(s.offset_up),
+            static_cast<float>(s.offset_right)};
+
+    return { m, pos };
+}
+
+
+void neuralnet_tracker::draw_gizmos(
+    cv::Mat frame,
+    const PoseEstimator::Face &face,
+    const Affine& pose) const
+{
     if (last_roi) 
     {
         const int col = 255;
@@ -335,86 +466,49 @@ bool neuralnet_tracker::detect()
         cv::rectangle(frame, *last_localizer_roi, cv::Scalar(col, 0, 255-col), /*thickness=*/1);
     }
 
-    cv::circle(frame, static_cast<cv::Point>(face->center), int(face->size), cv::Scalar(255,255,255), 2);
-    cv::circle(frame, static_cast<cv::Point>(face->center), 3, cv::Scalar(255,255,255), -1);
+    if (face.size>=1.f)
+        cv::circle(frame, static_cast<cv::Point>(face.center), int(face.size), cv::Scalar(255,255,255), 2);
+    cv::circle(frame, static_cast<cv::Point>(face.center), 3, cv::Scalar(255,255,255), -1);
 
-    const Eigen::Quaternionf rot_correction = compute_rotation_correction(
-        normalize(face->center, frame.rows, frame.cols),
-        intrinsics.focal_length_w);
-
-    const Eigen::Quaternionf rot = rot_correction*face->rotation;
-
-    Eigen::Matrix3f m = rot.toRotationMatrix();
-    auto draw_coord_line = [&](const Eigen::Vector3f &v, const cv::Scalar& color)
+    auto draw_coord_line = [&](int i, const cv::Scalar& color)
     {
+        const float vx = -pose.R(2,i);
+        const float vy = -pose.R(1,i);
         static constexpr float len = 100.f;
-        cv::Point q = face->center + len*cv::Point2f{-v[2], -v[1]};
-        cv::line(frame, static_cast<cv::Point>(face->center), static_cast<cv::Point>(q), color, 2);
+        cv::Point q = face.center + len*cv::Point2f{vx, vy};
+        cv::line(frame, static_cast<cv::Point>(face.center), static_cast<cv::Point>(q), color, 2);
     };
-    draw_coord_line(m.col(0), {0, 0, 255});
-    draw_coord_line(m.col(1), {0, 255, 0});
-    draw_coord_line(m.col(2), {255, 0, 0});
+    draw_coord_line(0, {0, 0, 255});
+    draw_coord_line(1, {0, 255, 0});
+    draw_coord_line(2, {255, 0, 0});
 
-    /*
-         
-       hhhhhh  <- head size (meters)
-      \      | -----------------------
-       \     |                         \
-        \    |                          |
-         \   |                          |- tz (meters)
-          ____ <- face->size / width    |
-           \ |  |                       |
-            \|  |- focal length        /
-               ------------------------
-    */
-
-    // Compute the location the network outputs in 3d space.
-    const Eigen::Vector3f face_world_pos = image_to_world(face->center.x, face->center.y, face->size, head_size_meters);
-    // But this is in general not the location of the rotation joint in the neck.
-    // So we need an extra offset. Which we determine by solving
-    // z,y,z-pos = head_joint_loc + R_face * offset
-    const Eigen::Vector3f pos = face_world_pos
-        - m * Eigen::Vector3f{
-            static_cast<float>(s.offset_fwd), 
-            static_cast<float>(s.offset_up),
-            0.f};
-
-    { 
+    if (s.show_network_input)
+    {
+        cv::Mat netinput = poseestimator->last_network_input();
+        if (!netinput.empty())
+        {
+            const int w = std::min(netinput.cols, frame.cols);
+            const int h = std::min(netinput.rows, frame.rows);
+            cv::Rect roi(0, 0, w, h);
+            netinput(roi).copyTo(frame(roi));
+        }
+    }
+    {
         // Draw the computed joint position
-        auto xy = world_to_image(pos).eval();
+        auto xy = world_to_image(pose.t);
         cv::circle(frame, cv::Point(xy[0],xy[1]), 5, cv::Scalar(0,0,255), -1);
     }
 
-    // Definition of coordinate frame
-    //   x: Pointing forward, i.e. toward the camera
-    //   y: Up
-    //   z: Right, from the perspective of the tracked person.
-    // When looking straight ahead the rotation is zero.
-    const auto mx = m.col(0);
-    const auto my = m.col(1);
-    const auto mz = -m.col(2);
-    const float yaw = std::atan2(mx[2], mx[0]);
-    const float pitch = -std::atan2(-mx[1], std::sqrt(mx[2]*mx[2]+mx[0]*mx[0]));
-    const float roll = std::atan2(-my[2], mz[2]);
-    {
-        QMutexLocker lck(&mtx);
-        constexpr double rad2deg = 180/M_PI;
-        pose[Yaw]   = rad2deg * yaw;
-        pose[Pitch] = rad2deg * pitch;
-        pose[Roll]  = rad2deg * roll;
-
-        // convert to cm
-        pose[TX] = -pos[2] * 100.;
-        pose[TY] = pos[1] * 100.;
-        pose[TZ] = -pos[0] * 100.;
-    }
-    return true;
+    char buf[128];
+    ::snprintf(buf, sizeof(buf), "%d Hz, Max: %d ms", clamp(int(fps), 0, 9999), int(max_frame_time*1000.));
+    cv::putText(frame, buf, cv::Point(10, frame.rows-10), cv::FONT_HERSHEY_PLAIN, 1, cv::Scalar(0, 255, 0), 1);
 }
 
 
 neuralnet_tracker::neuralnet_tracker()
 {
     opencv_init();
+    cv::setNumThreads(num_threads);
 }
 
 
@@ -443,7 +537,6 @@ module_status neuralnet_tracker::start_tracker(QFrame* videoframe)
 
 bool neuralnet_tracker::load_and_initialize_model()
 {
-    // QFile::encodeName
     const QString localizer_model_path_enc =
         OPENTRACK_BASE_PATH+"/" OPENTRACK_I18N_PATH "/../models/head-localizer.onnx";
     const QString poseestimator_model_path_enc =
@@ -456,11 +549,15 @@ bool neuralnet_tracker::load_and_initialize_model()
             "tracker-neuralnet"
         };
         auto opts = Ort::SessionOptions{};
-        opts.SetIntraOpNumThreads(1); // TODO use openmp control modes?
-        opts.SetInterOpNumThreads(1);
+        // Do thread settings here do anything?
+        // There is a warning which says to control number of threads via
+        // openmp settings. Which is what we do. omp_set_num_threads directly
+        // before running the inference pass.
+        opts.SetIntraOpNumThreads(num_threads);
+        opts.SetInterOpNumThreads(num_threads);
         opts.SetGraphOptimizationLevel(
             GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
-        //opts.DisablePerSessionThreads();
+
         opts.EnableCpuMemArena();
         allocator_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
@@ -474,7 +571,8 @@ bool neuralnet_tracker::load_and_initialize_model()
     }
     catch (const Ort::Exception &e)
     {
-        std::cerr << e.what() << std::endl;
+        qDebug() << "Failed to initialize the neural network models. ONNX error message: " 
+            << e.what();
         return false;
     }
     return true;
@@ -525,7 +623,7 @@ void neuralnet_tracker::set_intrinsics()
 }
 
 
-Eigen::Vector3f neuralnet_tracker::image_to_world(float x, float y, float size, float real_size) const
+vec3 neuralnet_tracker::image_to_world(float x, float y, float size, float real_size) const
 {
     // Compute the location the network outputs in 3d space.
     const float xpos = -(intrinsics.focal_length_w * frame.cols * 0.5f) / size * real_size;
@@ -535,27 +633,13 @@ Eigen::Vector3f neuralnet_tracker::image_to_world(float x, float y, float size, 
 }
 
 
-Eigen::Vector2f neuralnet_tracker::world_to_image(const Eigen::Vector3f& pos) const
+vec2 neuralnet_tracker::world_to_image(const vec3& pos) const
 {
     const float xscr = pos[2] / pos[0] * intrinsics.focal_length_w;
     const float yscr = pos[1] / pos[0] * intrinsics.focal_length_h;
     const float x = (xscr+1.)*0.5f*frame.cols;
     const float y = (yscr+1.)*0.5f*frame.rows;
     return {x, y};
-}
-
-
-void neuralnet_tracker::update_fps()
-{
-    const double dt = fps_timer.elapsed_seconds();
-    fps_timer.start();
-    const double alpha = dt/(dt + RC);
-
-    if (dt > 1e-3)
-    {
-        fps *= 1 - alpha;
-        fps += alpha * (1./dt + .8);
-    }
 }
 
 
@@ -567,10 +651,11 @@ void neuralnet_tracker::run()
     if (!load_and_initialize_model())
         return;
 
-    fps_timer.start();
+    std::chrono::high_resolution_clock clk;
 
     while (!isInterruptionRequested())
     {
+        auto t = clk.now();
         {
             QMutexLocker l(&camera_mtx);
 
@@ -578,6 +663,7 @@ void neuralnet_tracker::run()
 
             if (!res)
             {
+                l.unlock();
                 portable::sleep(100);
                 continue;
             }
@@ -601,64 +687,81 @@ void neuralnet_tracker::run()
 
         set_intrinsics();
 
-        update_fps();
-
         detect();
-
-        std::cout << "fps = " << fps << "\n";
 
         if (frame.rows > 0)
             videoWidget->update_image(frame);
+        
+        update_fps(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                clk.now() - t).count()*1.e-3);
     }
+}
+
+
+void neuralnet_tracker::update_fps(double dt)
+{
+    const double alpha = dt/(dt + RC);
+
+    if (dt > 1e-6)
+    {
+        fps *= 1 - alpha;
+        fps += alpha * 1./dt;
+    }
+
+    max_frame_time = std::max(max_frame_time, dt);
 }
 
 
 void neuralnet_tracker::data(double *data)
 {
-    QMutexLocker lck(&mtx);
+    Affine tmp = [&]()
+    {
+        QMutexLocker lck(&mtx);
+        return pose_;
+    }();
 
-    data[Yaw] = pose[Yaw];
-    data[Pitch] = pose[Pitch];
-    data[Roll] = pose[Roll];
-    data[TX] = pose[TX];
-    data[TY] = pose[TY];
-    data[TZ] = pose[TZ];
+    const auto& mx = tmp.R.col(0);
+    const auto& my = tmp.R.col(1);
+    const auto& mz = -tmp.R.col(2);
+
+    const float yaw = std::atan2(mx(2), mx(0));
+    const float pitch = -std::atan2(-mx(1), std::sqrt(mx(2)*mx(2)+mx(0)*mx(0)));
+    const float roll = std::atan2(-my(2), mz(2));
+    {
+        constexpr double rad2deg = 180/M_PI;
+        data[Yaw]   = rad2deg * yaw;
+        data[Pitch] = rad2deg * pitch;
+        data[Roll]  = rad2deg * roll;
+
+        // convert to cm
+        data[TX] = -tmp.t[2] * 0.1;
+        data[TY] = tmp.t[1] * 0.1;
+        data[TZ] = -tmp.t[0] * 0.1;
+    }
+}
+
+
+Affine neuralnet_tracker::pose()
+{
+    QMutexLocker lck(&mtx);
+    return pose_;
 }
 
 
 void neuralnet_dialog::make_fps_combobox()
 {
-    std::vector<std::tuple<int, int>> resolutions;
-    resolutions.reserve(fps_MAX);
-
     for (int k = 0; k < fps_MAX; k++)
     {
-        int hz = enum_to_fps(k);
-        resolutions.emplace_back(k, hz);
-    }
-
-    std::sort(resolutions.begin(), resolutions.end(), [](const auto& a, const auto& b) {
-        auto [idx1, hz1] = a;
-        auto [idx2, hz2] = b;
-
-        return hz1 < hz2;
-    });
-
-    for (auto [idx, hz] : resolutions)
-    {
-        QString name;
-
-        if (hz == 0)
-            name = tr("Default");
-        else
-            name = QString::number(hz);
-
-        ui.cameraFPS->addItem(name, idx);
+        const int hz = enum_to_fps(k);
+        const QString name = (hz == 0) ? tr("Default") : QString::number(hz);
+        ui.cameraFPS->addItem(name, k);
     }
 }
 
 
-neuralnet_dialog::neuralnet_dialog()
+neuralnet_dialog::neuralnet_dialog() :
+    trans_calib(1, 2)
 {
     ui.setupUi(this);
 
@@ -670,8 +773,10 @@ neuralnet_dialog::neuralnet_dialog()
 
     tie_setting(s.camera_name, ui.cameraName);
     tie_setting(s.fov, ui.cameraFOV);
-    tie_setting(s.offset_fwd, ui.cx);
-    tie_setting(s.offset_up, ui.cy);
+    tie_setting(s.offset_fwd, ui.tx_spin);
+    tie_setting(s.offset_up, ui.ty_spin);
+    tie_setting(s.offset_right, ui.tz_spin);
+    tie_setting(s.show_network_input, ui.showNetworkInput);
 
     connect(ui.buttonBox, SIGNAL(accepted()), this, SLOT(doOK()));
     connect(ui.buttonBox, SIGNAL(rejected()), this, SLOT(doCancel()));
@@ -680,6 +785,10 @@ neuralnet_dialog::neuralnet_dialog()
     connect(&s.camera_name, value_::value_changed<QString>(), this, &neuralnet_dialog::update_camera_settings_state);
 
     update_camera_settings_state(s.camera_name);
+
+    connect(&calib_timer, &QTimer::timeout, this, &neuralnet_dialog::trans_calib_step);
+    calib_timer.setInterval(35);
+    connect(ui.tcalib_button,SIGNAL(toggled(bool)), this, SLOT(startstop_trans_calib(bool)));
 }
 
 
@@ -715,7 +824,94 @@ void neuralnet_dialog::update_camera_settings_state(const QString& name)
 }
 
 
+void neuralnet_dialog::register_tracker(ITracker * x)
+{
+    tracker = static_cast<neuralnet_tracker*>(x);
+    ui.tcalib_button->setEnabled(true);
+}
+
+
+void neuralnet_dialog::unregister_tracker()
+{
+    tracker = nullptr;
+    ui.tcalib_button->setEnabled(false);
+}
+
+
+void neuralnet_dialog::trans_calib_step()
+{
+    if (tracker)
+    {
+        const Affine X_CM = [&]() { 
+            QMutexLocker l(&calibrator_mutex);
+            return tracker->pose();
+        }();
+        trans_calib.update(X_CM.R, X_CM.t);
+        auto [_, nsamples] = trans_calib.get_estimate();
+
+        constexpr int min_yaw_samples = 15;
+        constexpr int min_pitch_samples = 12;
+        constexpr int min_samples = min_yaw_samples+min_pitch_samples;
+
+        // Don't bother counting roll samples. Roll calibration is hard enough
+        // that it's a hidden unsupported feature anyway.
+
+        QString sample_feedback;
+        if (nsamples[0] < min_yaw_samples)
+            sample_feedback = tr("%1 yaw samples. Yaw more to %2 samples for stable calibration.").arg(nsamples[0]).arg(min_yaw_samples);
+        else if (nsamples[1] < min_pitch_samples)
+            sample_feedback = tr("%1 pitch samples. Pitch more to %2 samples for stable calibration.").arg(nsamples[1]).arg(min_pitch_samples);
+        else
+        {
+            const int nsamples_total = nsamples[0] + nsamples[1];
+            sample_feedback = tr("%1 samples. Over %2, good!").arg(nsamples_total).arg(min_samples);
+        }
+        ui.sample_count_display->setText(sample_feedback);
+    }
+    else
+        startstop_trans_calib(false);
+}
+
+
+void neuralnet_dialog::startstop_trans_calib(bool start)
+{
+    QMutexLocker l(&calibrator_mutex);
+    // FIXME: does not work ...  
+    if (start)
+    {
+        qDebug() << "pt: starting translation calibration";
+        calib_timer.start();
+        trans_calib.reset();
+        ui.sample_count_display->setText(QString());
+        // Tracker must run with zero'ed offset for calibration.
+        s.offset_fwd = 0;
+        s.offset_up = 0;
+        s.offset_right = 0;
+    }
+    else
+    {
+        calib_timer.stop();
+        qDebug() << "pt: stopping translation calibration";
+        {
+            auto [tmp, nsamples] = trans_calib.get_estimate();
+            s.offset_fwd = int(tmp[0]);
+            s.offset_up = int(tmp[1]);
+            s.offset_right = int(tmp[2]);
+        }
+    }
+    ui.tx_spin->setEnabled(!start);
+    ui.ty_spin->setEnabled(!start);
+    ui.tz_spin->setEnabled(!start);
+
+    if (start)
+        ui.tcalib_button->setText(tr("Stop calibration"));
+    else
+        ui.tcalib_button->setText(tr("Start calibration"));
+}
+
+
 settings::settings() : opts("neuralnet-tracker") {}
 
+} // neuralnet_tracker_ns
 
 OPENTRACK_DECLARE_TRACKER(neuralnet_tracker, neuralnet_dialog, neuralnet_metadata)
